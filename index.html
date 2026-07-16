@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Video Generator - Shorts/TikTok</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 text-white min-h-screen flex flex-col items-center justify-center p-4">
+  <div class="max-w-2xl w-full bg-gray-800 rounded-2xl shadow-2xl p-6 space-y-6">
+    <h1 class="text-3xl font-bold text-center">🎬 AI Video Shorts Generator</h1>
+    <p class="text-center text-gray-400">Gabungkan narasi TTS natural, video stok gratis, subtitle otomatis</p>
+
+    <!-- Input Script -->
+    <div>
+      <label class="block mb-1">Naskah Narasi</label>
+      <textarea id="script" rows="5" class="w-full p-3 bg-gray-700 rounded-lg text-white placeholder-gray-400" placeholder="Masukkan teks narasi..."></textarea>
+    </div>
+
+    <!-- Keyword Video & Bahasa -->
+    <div class="grid grid-cols-2 gap-4">
+      <div>
+        <label class="block mb-1">Keyword Video (tema)</label>
+        <input id="keyword" type="text" class="w-full p-3 bg-gray-700 rounded-lg text-white" placeholder="Contoh: alam, bisnis, teknologi">
+      </div>
+      <div>
+        <label class="block mb-1">Bahasa TTS</label>
+        <select id="lang" class="w-full p-3 bg-gray-700 rounded-lg text-white">
+          <option value="id">Indonesia</option>
+          <option value="en">English</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- Pexels API Key -->
+    <div>
+      <label class="block mb-1">Pexels API Key <span class="text-sm text-gray-400">(gratis, daftar di <a href="https://www.pexels.com/api/" target="_blank" class="underline">pexels.com/api</a>)</span></label>
+      <input id="pexelsKey" type="password" class="w-full p-3 bg-gray-700 rounded-lg text-white" placeholder="Masukkan API key Pexels">
+    </div>
+
+    <!-- Progress & Download -->
+    <button id="generateBtn" class="w-full bg-indigo-600 hover:bg-indigo-700 py-3 rounded-lg font-semibold transition">🎥 Generate Video</button>
+    <div id="progress" class="text-sm text-gray-300 hidden"></div>
+    <div id="downloadArea" class="hidden text-center">
+      <a id="downloadLink" href="#" class="inline-block bg-green-600 hover:bg-green-700 py-2 px-6 rounded-lg font-semibold">⬇ Download Video</a>
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js"></script>
+  <script>
+    const { FFmpeg } = FFmpegWASM;
+    const ffmpeg = new FFmpeg();
+
+    // Simpan API key di localStorage agar tidak isi ulang
+    const pexelsKeyInput = document.getElementById('pexelsKey');
+    if (localStorage.getItem('pexelsKey')) {
+      pexelsKeyInput.value = localStorage.getItem('pexelsKey');
+    }
+    pexelsKeyInput.addEventListener('change', () => {
+      localStorage.setItem('pexelsKey', pexelsKeyInput.value);
+    });
+
+    // Fungsi split kalimat sederhana
+    function splitSentences(text) {
+      return text.match(/[^.!?\n]+[.!?\n]*/g)?.map(s => s.trim()).filter(Boolean) || [text];
+    }
+
+    // Ambil audio TTS dari proxy
+    async function fetchTTS(text, lang) {
+      const url = `/api/tts?text=${encodeURIComponent(text)}&lang=${lang}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error('TTS gagal');
+      return await res.blob();
+    }
+
+    // Gabungkan beberapa AudioBuffer menjadi WAV
+    async function concatenateAudioBuffers(buffers) {
+      const audioCtx = new AudioContext();
+      const sampleRates = buffers.map(b => b.sampleRate);
+      const targetRate = Math.max(...sampleRates); // pakai rate tertinggi
+      const totalLength = buffers.reduce((sum, buf) => {
+        const duration = buf.length / buf.sampleRate;
+        return sum + Math.ceil(duration * targetRate);
+      }, 0);
+
+      const outBuffer = audioCtx.createBuffer(
+        Math.max(1, buffers[0].numberOfChannels),
+        totalLength,
+        targetRate
+      );
+
+      let offset = 0;
+      for (const buf of buffers) {
+        const resampleRatio = targetRate / buf.sampleRate;
+        for (let ch = 0; ch < outBuffer.numberOfChannels; ch++) {
+          const outData = outBuffer.getChannelData(ch);
+          const srcData = buf.getChannelData(Math.min(ch, buf.numberOfChannels - 1));
+          for (let i = 0; i < buf.length; i++) {
+            const srcIndex = Math.floor(i * resampleRatio);
+            if (srcIndex < buf.length) {
+              outData[offset + i] = srcData[srcIndex];
+            }
+          }
+        }
+        offset += Math.ceil(buf.length * resampleRatio);
+      }
+      return outBuffer;
+    }
+
+    // Encode AudioBuffer ke WAV
+    function encodeWAV(buffer) {
+      const numChannels = buffer.numberOfChannels;
+      const sampleRate = buffer.sampleRate;
+      const format = 1; // PCM
+      const bitsPerSample = 16;
+      const data = new Int16Array(buffer.length * numChannels);
+      for (let ch = 0; ch < numChannels; ch++) {
+        const channel = buffer.getChannelData(ch);
+        for (let i = 0; i < buffer.length; i++) {
+          data[i * numChannels + ch] = Math.max(-1, Math.min(1, channel[i])) * 0x7FFF;
+        }
+      }
+      const byteRate = sampleRate * numChannels * bitsPerSample / 8;
+      const blockAlign = numChannels * bitsPerSample / 8;
+      const wav = new ArrayBuffer(44 + data.length * 2);
+      const view = new DataView(wav);
+      // RIFF header
+      writeString(view, 0, 'RIFF');
+      view.setUint32(4, 36 + data.length * 2, true);
+      writeString(view, 8, 'WAVE');
+      writeString(view, 12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, format, true);
+      view.setUint16(22, numChannels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, byteRate, true);
+      view.setUint16(32, blockAlign, true);
+      view.setUint16(34, bitsPerSample, true);
+      writeString(view, 36, 'data');
+      view.setUint32(40, data.length * 2, true);
+      for (let i = 0; i < data.length; i++) {
+        view.setInt16(44 + i * 2, data[i], true);
+      }
+      return new Blob([wav], { type: 'audio/wav' });
+      function writeString(view, offset, string) {
+        for (let i = 0; i < string.length; i++) {
+          view.setUint8(offset + i, string.charCodeAt(i));
+        }
+      }
+    }
+
+    // Dapatkan video dari Pexels
+    async function fetchStockVideo(keyword, apiKey) {
+      const res = await fetch(`https://api.pexels.com/videos/search?query=${encodeURIComponent(keyword)}&per_page=1&orientation=portrait`, {
+        headers: { Authorization: apiKey }
+      });
+      const data = await res.json();
+      if (!data.videos?.length) throw new Error('Video tidak ditemukan');
+      const videoFile = data.videos[0].video_files.find(f => f.quality === 'hd' || f.quality === 'sd');
+      if (!videoFile) throw new Error('File video tidak tersedia');
+      const videoRes = await fetch(videoFile.link);
+      return await videoRes.blob();
+    }
+
+    // Escape string untuk drawtext FFmpeg
+    function escapeFFmpegText(text) {
+      return text
+        .replace(/\\/g, '\\\\')
+        .replace(/'/g, "'\\''")
+        .replace(/:/g, '\\:')
+        .replace(/,/g, '\\,');
+    }
+
+    // Main process
+    document.getElementById('generateBtn').addEventListener('click', async () => {
+      const script = document.getElementById('script').value.trim();
+      const keyword = document.getElementById('keyword').value.trim() || script.split(' ').slice(0, 3).join(' ');
+      const lang = document.getElementById('lang').value;
+      const pexelsKey = document.getElementById('pexelsKey').value.trim();
+      const progressDiv = document.getElementById('progress');
+      const downloadArea = document.getElementById('downloadArea');
+      const downloadLink = document.getElementById('downloadLink');
+      progressDiv.classList.remove('hidden');
+      downloadArea.classList.add('hidden');
+
+      if (!script || !pexelsKey) {
+        alert('Naskah dan Pexels API Key wajib diisi.');
+        progressDiv.classList.add('hidden');
+        return;
+      }
+
+      try {
+        progressDiv.textContent = '🔄 Memuat FFmpeg.wasm...';
+        await ffmpeg.load({ coreURL: 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm/ffmpeg-core.js' });
+
+        // 1. Split teks & ambil TTS per kalimat
+        const sentences = splitSentences(script);
+        progressDiv.textContent = `🗣️ Mengambil TTS untuk ${sentences.length} kalimat...`;
+        const audioChunks = [];
+        const durations = [];
+        let totalDuration = 0;
+
+        for (const sentence of sentences) {
+          const blob = await fetchTTS(sentence, lang);
+          const arrayBuffer = await blob.arrayBuffer();
+          const audioCtx = new AudioContext();
+          const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+          const duration = audioBuffer.duration;
+          audioChunks.push(audioBuffer);
+          durations.push(duration);
+          totalDuration += duration;
+        }
+
+        // 2. Gabungkan audio & jadikan WAV
+        progressDiv.textContent = '🎚️ Menggabungkan audio...';
+        const combinedBuffer = await concatenateAudioBuffers(audioChunks);
+        const wavBlob = encodeWAV(combinedBuffer);
+
+        // 3. Ambil video stok
+        progressDiv.textContent = '📹 Mengambil video stok...';
+        const videoBlob = await fetchStockVideo(keyword, pexelsKey);
+
+        // 4. Siapkan font untuk subtitle
+        progressDiv.textContent = '🔤 Mengunduh font...';
+        const fontBlob = await fetch('https://github.com/googlefonts/roboto/raw/main/src/hinted/Roboto-Regular.ttf?raw=true').then(r => r.blob());
+
+        // 5. Tulis file ke MEMFS FFmpeg
+        await ffmpeg.writeFile('video.mp4', new Uint8Array(await videoBlob.arrayBuffer()));
+        await ffmpeg.writeFile('audio.wav', new Uint8Array(await wavBlob.arrayBuffer()));
+        await ffmpeg.writeFile('font.ttf', new Uint8Array(await fontBlob.arrayBuffer()));
+
+        // 6. Bangun filter_complex
+        let subtitleFilters = '';
+        let timeAcc = 0;
+        for (let i = 0; i < sentences.length; i++) {
+          const start = timeAcc;
+          const end = timeAcc + durations[i];
+          const text = escapeFFmpegText(sentences[i]);
+          subtitleFilters += `,drawtext=fontfile=/font.ttf:text='${text}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.6:boxborderw=10:x=(w-text_w)/2:y=h*0.85:enable='between(t,${start},${end})'`;
+          timeAcc = end;
+        }
+
+        const filterComplex = `[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,loop=-1:1:0,trim=0:${totalDuration},setpts=PTS-STARTPTS${subtitleFilters}[vout]`;
+
+        // 7. Jalankan FFmpeg
+        progressDiv.textContent = '🎞️ Merender video...';
+        await ffmpeg.exec([
+          '-stream_loop', '-1', '-i', 'video.mp4',
+          '-i', 'audio.wav',
+          '-filter_complex', filterComplex,
+          '-map', '[vout]', '-map', '1:a',
+          '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23',
+          '-pix_fmt', 'yuv420p',
+          '-c:a', 'aac', '-b:a', '128k',
+          '-shortest',
+          'output.mp4'
+        ]);
+
+        // 8. Baca hasil & buat link unduh
+        progressDiv.textContent = '✅ Video berhasil dibuat!';
+        const data = await ffmpeg.readFile('output.mp4');
+        const videoUrl = URL.createObjectURL(new Blob([data.buffer], { type: 'video/mp4' }));
+        downloadLink.href = videoUrl;
+        downloadLink.download = 'video-shorts.mp4';
+        downloadArea.classList.remove('hidden');
+
+      } catch (error) {
+        progressDiv.textContent = `❌ Error: ${error.message}`;
+      }
+    });
+  </script>
+</body>
+</html>
